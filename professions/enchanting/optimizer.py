@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 from inventory_manager import Inventory
 import enchanting.scraper as scraper
+from professions import Profession
 
 def getMatDF(df, mat_df_columns):
 	mat_df = pd.DataFrame(index=df.index, columns=mat_df_columns)
@@ -21,16 +22,6 @@ def getAHPrices():
 	df.set_index("Item", inplace=True)
 	return df
 
-def levelChance(skill, gray, yellow):
-	pLevel = (gray - skill) / (gray - yellow)
-	return pLevel
-
-def lesserToGreater(lesser_price):
-	return lesser_price * 3
-
-def greaterToLesser(greater_price):
-	return greater_price / 3
-
 def exportLog(log, cost):
 	pass
 
@@ -43,22 +34,28 @@ def analyzePath(self, results, mats_used):
 
 
 
-class Enchanter(object):
+class Enchanter(Profession):
 	def __init__(self, df, mat_df, my_mats, skill_interval=3, max_skill=450):
-		self.df = df
-		self.mats = mat_df
+		# General objects
 		self.skill_interval = skill_interval
-		self.my_mats = my_mats
-		self.prices = self.cachePrices()
-		self.df["cost"] = self.priceItems()
 		self.skill = 1
 		self.max_skill = max_skill
+
+		# Profession-class objects
 		self.mats_used = {}
 		self.receipt = []
 		self.log = []
 		self.inventory = Inventory(my_mats)
-		self.unlockSkills()
-		print(self.df)
+		self.prices = self.cachePrices()
+
+		# Profession-specific objects
+		self.formulas = df
+		self.formulas["cost"] = self.priceItems()
+		self.mats = mat_df
+		self.my_mats = my_mats
+
+		# Init function
+		self.available = self.unlockSkills(self.skill, self.formulas)
 
 	def cachePrices(self):
 		path = os.path.abspath(os.path.dirname(__name__))
@@ -78,30 +75,26 @@ class Enchanter(object):
 
 	def priceItems(self):
 		costs = []
-		for index, row in self.df.iterrows():
+		for index, row in self.formulas.iterrows():
 			cost = self.getItemCost(index)
 			costs.append(cost)
 		return costs
 
 	def getItemCost(self, item):
-		mats = self.df.at[item, "materials"]
+		mats = self.formulas.at[item, "materials"]
 		cost = 0
 		for mat, qty in mats.items():
 			price = self.prices.at[mat, "price"]
 			if "Lesser" in mat:
 				alt = "Greater" + mat[len("Lesser"):]
-				price1 = greaterToLesser(self.prices.at[alt, "price"])
+				price1 = self.greaterToLesser(self.prices.at[alt, "price"])
 				price = min(price, price1)
 			elif "Greater" in mat:
 				alt = "Lesser" + mat[len("Greater"):]
-				price1 = lesserToGreater(self.prices.at[alt, "price"])
+				price1 = self.lesserToGreater(self.prices.at[alt, "price"])
 				price = min(price, price1)
 			cost += (price * qty)
 		return cost
-
-	def unlockSkills(self):
-		self.available = self.df.loc[self.df["orange"] <= self.skill].copy(deep=False)
-		return self.available
 
 	def optimizePath(self, based_on="cost"):
 		if based_on == "cost":
@@ -114,7 +107,7 @@ class Enchanter(object):
 					elif row["gray"] > 0:
 						if not math.isnan(row["cost"]):
 							try:
-								oc = self.calculateOpCost(row["cost"],row["gray"],row["yellow"])
+								oc = self.getOpportunityCost(row["cost"],row["gray"],row["yellow"])
 								op_costs.append(oc)
 								items.append(index)
 							except:
@@ -122,73 +115,27 @@ class Enchanter(object):
 								print("YELLOW:",row["yellow"],"|GRAY:",row["gray"])
 				ref = op_costs.index(min(op_costs))
 				item = items[ref]
-				self.craft(item)
-		results = {"events":len(self.log), "cost":sum(self.receipt)}
-		return results
+				result = self.craft(self.skill, item, self.formulas)
+				if result:
+					self.skill = self.levelSkill(self.skill)
+					self.available = self.unlockSkills(self.skill, self.formulas)
+		# return efficiency metrics
+		return {"events":len(self.log), "cost":sum(self.receipt)}
 
-	def calculateOpCost(self, cost, gray, yellow):
-		prob = levelChance(self.skill, gray, yellow)
-		if prob != 0:
-			return (1 / prob) * cost
-		else:
-			return 100000000
+	def lesserToGreater(self, lesser_price):
+		return lesser_price * 3
 
-	def craft(self, item):
-		print("Crafting {}...".format(item))
-		init_skill = self.skill
-		if self.skill < self.df.at[item, "orange"]:
-			return False
-		elif self.skill < self.df.at[item, "yellow"]:
-			pLevel = 1
-		elif self.skill < self.df.at[item, "gray"]:
-			pLevel = levelChance(self.skill, self.df.at[item, "gray"], self.df.at[item, "yellow"])
-		else:
-			pLevel = 0
-		outcome = self.attemptLevel(item, pLevel)
-		if outcome:
-			print("Success! Enchanting skill leveled to {}".format(self.skill))
-		else:
-			print("Oops, failed to level from {}!".format(self.skill))
-		mats = self.df.at[item, "materials"]
-		for mat, qty in mats.items():
-			price = self.consumeMaterial(mat, qty)
-			self.receipt.append(qty * price)
-		record = [item, init_skill, self.skill, self.skill - init_skill]
-		self.log.append(record)
+	def greaterToLesser(self, greater_price):
+		return greater_price / 3
 
-	def consumeMaterial(self, mat, qty):
-		price = self.prices.at[mat, "price"]
-		if mat in self.inventory.items:
-			confirmation = self.inventory.confirmInventory(mat, qty)
-			if isinstance(confirmation, int):
-				attempt = self.inventory.consume(mat, confirmation)
-				if attempt:
-					remainder = qty - confirmation
-					price = (0 * confirmation + price * remainder) / qty
-			elif confirmation:
-				attempt = self.inventory.consume(mat, qty)
-				if attempt:
-					price = 0
 
-		if mat in self.mats_used.keys():
-			self.mats_used[mat]["qty"] += qty
-			self.mats_used[mat]["cost"] = self.mats_used[mat]["qty"] * price
-		else:
-			self.mats_used[mat] = {"qty": qty, "cost": qty * price}
-		return price
 
-	def attemptLevel(self, item, pLevel):
-		S = pLevel * 100
-		F = (1 - pLevel) * 100
-		outcomes = [True] * int(S) + [False] * int(F)
-		random.shuffle(outcomes)
-		outcome = random.choice(outcomes)
-		if outcome:
-			self.skill += self.skill_interval
-			self.unlockSkills()
-			return True
-		else:
-			return False
+
+
+
+
+
+
 
 def performTest(df, mat_df, loops):
 	plt.figure(figsize=(12,12), dpi=100)
@@ -218,7 +165,7 @@ def go(optimize=False):
 		#analyzePath(results, profession.mats_used)
 
 if __name__ == "__main__":
-
+	from ..professions import Profession
 	go(optimize=False)
 	
 	
